@@ -40,7 +40,7 @@ script_name="erase-install"
 pkg_label="com.github.grahampugh.erase-install"
 
 # Version of this script
-version="30.2"
+version="31.0"
 
 # Directory in which to place the macOS installer. Overridden with --path
 installer_directory="/Applications"
@@ -56,14 +56,20 @@ mist_bin="/usr/local/bin/mist"
 
 # URL for downloading dialog (with tag version)
 # This ensures a compatible mist version is used if not using the package installer
-mist_version_required="1.14"
+mist_version_required="2.0"
 mist_download_url="https://github.com/ninxsoft/mist-cli/releases/download/v${mist_version_required}/mist-cli.${mist_version_required}.pkg"
 
 # URL for downloading swiftDialog (with tag version)
 # This ensures a compatible swiftDialog version is used if not using the package installer
-swiftdialog_version_required="2.2.1-4591"
+swiftdialog_version_required="2.3.2-4726"
 swiftdialog_tag_required=$(cut -d"-" -f1 <<< "$swiftdialog_version_required")
 dialog_download_url="https://github.com/bartreardon/swiftDialog/releases/download/v${swiftdialog_tag_required}/dialog-${swiftdialog_version_required}.pkg"
+
+# URL for downloading swiftDialog on macOS 11 (with tag version)
+# This ensures a compatible swiftDialog version is used if not using the package installer
+swiftdialog_bigsur_version_required="2.2.1-4591"
+swiftdialog_bigsur_tag_required=$(cut -d"-" -f1 <<< "$swiftdialog_bigsur_version_required")
+dialog_bigsur_download_url="https://github.com/bartreardon/swiftDialog/releases/download/v${swiftdialog_bigsur_tag_required}/dialog-${swiftdialog_bigsur_version_required}.pkg"
 
 # swiftDialog variables
 dialog_app="/Library/Application Support/Dialog/Dialog.app"
@@ -205,7 +211,7 @@ check_fmm() {
         # run the dialog command
         "$dialog_bin" "${dialog_args[@]}" 2>/dev/null
 
-        writelog "[wait_for_power] ERROR - Finy My still enabled after waiting for ${fmm_wait_timer}s, cannot continue."
+        writelog "[wait_for_power] ERROR - Find My still enabled after waiting for ${fmm_wait_timer}s, cannot continue."
         echo
         exit 1
     fi
@@ -242,11 +248,11 @@ check_for_mist() {
 # -----------------------------------------------------------------------------
 check_for_swiftdialog_app() {
     # swiftDialog 2.3 and higher are incompatible with macOS 11. Remove this version if present.
-    if [[ $(echo "$system_version_major < 12" | bc) == 1 && -d "$dialog_app" && -f "$dialog_bin" ]]; then
-        dialog_string=$("$dialog_bin" --version)
+    if [[ $(echo "$system_version_major < 12" | bc) -eq 1 && -d "$dialog_app" && -f "$dialog_bin" ]]; then
+        dialog_string=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" /Library/Application\ Support/Dialog/Dialog.app/Contents/Info.plist)
         dialog_minor_vers=$(cut -d. -f1,2 <<< "$dialog_string")
         if [[ $(echo "$dialog_minor_vers > 2.2" | bc) -eq 1 ]]; then
-            writelog "[check_for_swiftdialog_app] swiftDialog 2.3 or above is not compatible with macOS 11. Removing 2.3..."
+            writelog "[check_for_swiftdialog_app] swiftDialog v$dialog_string is installed but is not compatible with macOS $system_version_major. Removing v$dialog_string..."
             app_directory="/Library/Application Support/Dialog"
             bin_shortcut="/usr/local/bin/dialog"
             /bin/rm -rf "$app_directory" 
@@ -256,13 +262,25 @@ check_for_swiftdialog_app() {
 
     # now check for any version of swiftDialog and download if not present
     if [[ -d "$dialog_app" && -f "$dialog_bin" ]]; then
-        writelog "[check_for_swiftdialog_app] swiftDialog is installed ($dialog_app)"
+        dialog_string=$("$dialog_bin" --version)
+        dialog_minor_vers=$(cut -d. -f1,2 <<< "$dialog_string")
+        writelog "[check_for_swiftdialog_app] swiftDialog v$dialog_string is installed ($dialog_app)"
     else
         if [[ ! $no_curl ]]; then
-            writelog "[check_for_swiftdialog_app] Downloading swiftDialog..."
+            if [[ $(echo "$system_version_major < 12" | bc) -eq 1 ]]; then
+                # we need to get the older version of swiftDialog that is compatible with Big Sur
+                dialog_download_url="$dialog_bigsur_download_url"
+                writelog "[check_for_swiftdialog_app] Downloading swiftDialog for macOS $system_version_major..."
+            else
+                writelog "[check_for_swiftdialog_app] Downloading swiftDialog..."
+            fi
             if /usr/bin/curl -L "$dialog_download_url" -o "$workdir/dialog.pkg" ; then
-                if ! installer -pkg "$workdir/dialog.pkg" -target / ; then
+                if installer -pkg "$workdir/dialog.pkg" -target / ; then
+                    dialog_string=$("$dialog_bin" --version)
+                    dialog_minor_vers=$(cut -d. -f1,2 <<< "$dialog_string")
+                else
                     writelog "[check_for_swiftdialog_app] swiftDialog installation failed"
+                    exit 1
                 fi
             else
                 writelog "[check_for_swiftdialog_app] swiftDialog download failed"
@@ -271,7 +289,7 @@ check_for_swiftdialog_app() {
         fi
         # check it did actually get downloaded
         if [[ -d "$dialog_app" && -f "$dialog_bin" ]]; then
-            writelog "[check_for_swiftdialog_app] swiftDialog is installed"
+            writelog "[check_for_swiftdialog_app] swiftDialog v$dialog_string is installed"
         else
             writelog "[check_for_swiftdialog_app] Could not download swiftDialog."
             exit 1
@@ -453,14 +471,18 @@ check_newer_available() {
     
     # set the search restriction based on --os, --version or --sameos
     if [[ $prechosen_version ]]; then
-        writelog "[check_newer_available] Checking that selected version $prechosen_version is available"
+        writelog "[check_newer_available] Checking that selected version '$prechosen_version' is available"
         mist_args+=("$prechosen_version")
     elif [[ $prechosen_os ]]; then
-        writelog "[check_newer_available] Restricting to selected OS $prechosen_os"
-        mist_args+=("$prechosen_os")
+        # to avoid a bug where mist-cli does a glob search for the major version, convert it to the name (this is resolved in mist-cli 2.0 but will leave here for now to avoid problems with older installations)
+        prechosen_os_name=$(convert_os_to_name "$prechosen_os")
+        writelog "[check_newer_available] Restricting to selected OS '$prechosen_os'"
+        mist_args+=("$prechosen_os_name")
     elif [[ $sameos ]]; then
-        writelog "[run_mist] Restricting to selected OS $system_version_major"
-        mist_args+=("$system_version_major")
+        # to avoid a bug where mist-cli does a glob search for the major version, convert it to the name (this is resolved in mist-cli 2.0 but will leave here for now to avoid problems with older installations)
+        prechosen_os_name=$(convert_os_to_name "$system_version_major")
+        writelog "[run_mist] Restricting to selected OS '$system_version_major'"
+        mist_args+=("$prechosen_os_name")
     fi
 
     if [[ "$skip_validation" != "yes" ]]; then
@@ -477,13 +499,6 @@ check_newer_available() {
         darwin_version=$(get_darwin_from_os_version "$catalog")
         get_catalog
         writelog "[check_newer_available] Non-default catalog selected (darwin version $darwin_version)"
-        mist_args+=("--catalog-url")
-        mist_args+=("${catalogs[$darwin_version]}")
-    elif [[ $beta != "yes" ]]; then
-        # we have to restrict the mist-cli search to the production catalog to avoid getting RCs
-        darwin_version=$(get_darwin_from_os_version "$system_version_major")
-        get_catalog
-        writelog "[get_mist_list] Non-default catalog selected (darwin version $darwin_version)"
         mist_args+=("--catalog-url")
         mist_args+=("${catalogs[$darwin_version]}")
     fi
@@ -503,8 +518,13 @@ check_newer_available() {
         if [[ -f "$mist_export_file" ]]; then
             available_build=$( ljt 0.build "$mist_export_file" 2>/dev/null )
             if [[ "$available_build" ]]; then
-                echo "Comparing latest build found ($available_build) with cached installer build ($installer_build)"
-                compare_build_versions "$available_build" "$installer_build"
+                if [[ $installer_pkg_build ]]; then
+                    echo "Comparing latest build found ($available_build) with cached pkg installer build ($installer_pkg_build)"
+                    compare_build_versions "$available_build" "$installer_pkg_build"
+                else
+                    echo "Comparing latest build found ($available_build) with cached installer build ($installer_build)"
+                    compare_build_versions "$available_build" "$installer_build"
+                fi
                 if [[ "$first_build_newer" == "yes" ]]; then
                     newer_build_found="yes"
                 fi
@@ -758,6 +778,26 @@ confirm() {
         writelog "[$script_name] User FAILED to confirm erase-install or reinstall"
         exit 1
     fi
+}
+
+# -----------------------------------------------------------------------------
+# convert OS major version to name
+# -----------------------------------------------------------------------------
+convert_os_to_name () {
+    local os_name
+    case "$1" in
+        "11") os_name="Big Sur"
+            ;;
+        "12") os_name="Monterey"
+            ;;
+        "13") os_name="Ventura"
+            ;;
+        "14") os_name="Sonoma"
+            ;;
+        *) os_name="$1"
+            ;;
+    esac
+    echo "$os_name"
 }
 
 # -----------------------------------------------------------------------------
@@ -1022,15 +1062,6 @@ find_extra_packages() {
 }
 
 # -----------------------------------------------------------------------------
-# Return code 143 and finish the script when TERMinated or INTerrupted
-# -----------------------------------------------------------------------------
-# shellcheck disable=SC2317
-terminate() {
-    writelog "[terminate] Script was interrupted (last exit code was $?)"
-    exit 143
-}
-
-# -----------------------------------------------------------------------------
 # Things to carry out when the script exits
 # -----------------------------------------------------------------------------
 # shellcheck disable=SC2317
@@ -1104,12 +1135,11 @@ read_from_keychain() {
 # systems.
 # -----------------------------------------------------------------------------
 get_catalog() {
-    catalogs[17]="https://swscan.apple.com/content/catalogs/others/index-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog"
-    catalogs[18]="https://swscan.apple.com/content/catalogs/others/index-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog"
     catalogs[19]="https://swscan.apple.com/content/catalogs/others/index-10.15-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog"
     catalogs[20]="https://swscan.apple.com/content/catalogs/others/index-10.16-10.15-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog"
     catalogs[21]="https://swscan.apple.com/content/catalogs/others/index-12-10.16-10.15-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog"
     catalogs[22]="https://swscan.apple.com/content/catalogs/others/index-13-12-10.16-10.15-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog"
+    catalogs[23]="https://swscan.apple.com/content/catalogs/others/index-14-13-12-10.16-10.15-10.14-10.13-10.12-10.11-10.10-10.9-mountainlion-lion-snowleopard-leopard.merged-1.sucatalog"
 }
 
 # -----------------------------------------------------------------------------
@@ -1255,6 +1285,12 @@ get_user_details() {
                 writelog "[get_user_details] ERROR: Supplied credentials are in the incorrect form, so exiting..."
                 exit 1
             fi
+        elif ! pgrep -q Finder ; then
+            writelog "[get_user_details] ERROR! The startosinstall binary requires a user to be logged in."
+            echo
+            # kill caffeinate
+            kill_process "caffeinate"
+            exit 1
         elif [[ ! $silent ]]; then
             ask_for_credentials
             if [[ $? -eq 2 ]]; then
@@ -1506,18 +1542,61 @@ move_to_applications_folder() {
 }
 
 # -----------------------------------------------------------------------------
+# Rotate existing log files up to a maximum of 9 log files
+# Older files will be overwritten
+# -----------------------------------------------------------------------------
+log_rotate() {
+    # logs probably cannot be rotated when running as root
+    if [[ $EUID -ne 0 ]]; then
+        writelog "[log_rotate] Not running as root so cannot rotate logs"
+        return
+    fi
+
+    # writelog "[log_rotate] Start rotating logs in $logdir"
+    max_log_keep=9
+
+    # move all logs up one file
+    i="$max_log_keep"
+    while [[ "$i" -gt 0 ]];do
+        current_filename="$LOG_FILE.$((i-1))"
+        new_filename="$LOG_FILE.$i"
+        if [[ -f "$current_filename" ]];then
+            # writelog "[log_rotate] moving $current_filename to $new_filename"
+            mv "$current_filename" "$new_filename"
+        fi
+        ((i--))
+    done
+
+    if [[ -f "$LOG_FILE" ]];then
+        # writelog "[log_rotate] moving $LOG_FILE to $LOG_FILE.1"
+        mv "$LOG_FILE" "$LOG_FILE.1"
+    fi
+
+    # now create the new log file
+    echo "" > "$LOG_FILE"
+    exec > >(tee "${LOG_FILE}") 2>&1
+
+    writelog "[log_rotate] Finished rotating logs in $logdir"
+}
+
+# -----------------------------------------------------------------------------
 # Overwrite an existing installer.
 # This is called with the --overwrite option.
 # Note that multiple installers left around on the device can cause unexpected
 # results.  
 # -----------------------------------------------------------------------------
 overwrite_existing_installer() {
-    writelog "[overwrite_existing_installer] Overwrite option selected. Deleting existing version."
-    cached_installer=$( find /Volumes/*macOS* -maxdepth 2 -type d -name "Install*.app" -print -quit 2>/dev/null )
-    if [[ -d "$cached_installer" ]]; then
-        writelog "[$script_name] Mounted installer will be unmounted: $cached_installer"
-        existing_installer_mount_point=$(echo "$cached_installer" | cut -d/ -f 1-3)
-        diskutil unmount force "$existing_installer_mount_point"
+    if [[ -f "$working_installer_pkg" ]]; then
+        writelog "[$script_name] Deleting existing installer package"
+        rm -f "$working_installer_pkg"
+    else
+        writelog "[overwrite_existing_installer] Overwrite option selected. Deleting existing version."
+        cached_installer=$( find /Volumes/*macOS* -maxdepth 2 -type d -name "Install*.app" -print -quit 2>/dev/null )
+        if [[ -d "$cached_installer" ]]; then
+            writelog "[$script_name] Mounted installer will be unmounted: $cached_installer"
+            existing_installer_mount_point=$(echo "$cached_installer" | cut -d/ -f 1-3)
+            diskutil unmount force "$existing_installer_mount_point"
+        fi
     fi
     rm -f "$cached_dmg" "$cached_sparseimage" "$cached_installer_pkg" 
     rm -rf "$cached_installer_app"
@@ -1636,8 +1715,9 @@ run_fetch_full_installer() {
             if [[ $latest_ffi ]]; then
                 # we need to check if this version is older than the current system and abort if so
                 latest_ffi_major=$(cut -d. -f1 <<< "$latest_ffi")
-                latest_ffi_minor=$(cut -d. -f2,3 <<< "$latest_ffi")
-                if [[ $latest_ffi_major -lt $system_version_major || "$latest_ffi_major" == "$system_version_major" && $(echo "$latest_ffi_minor < $system_version_minor" | bc) == 1 ]]; then
+                latest_ffi_minor=$(cut -d. -f2 <<< "$latest_ffi")
+                latest_ffi_patch=$(cut -d. -f3 <<< "$latest_ffi")
+                if [[ $latest_ffi_major -lt $system_version_major || ("$latest_ffi_major" == "$system_version_major" && $(echo "$latest_ffi_minor < $system_version_minor" | bc) == 1) || ("$latest_ffi_major" == "$system_version_major" && "$latest_ffi_minor" == "$system_version_minor" && $(echo "$latest_ffi_patch < $system_version_patch" | bc) == 1) ]]; then
                     writelog "[run_fetch_full_installer] ERROR: latest version in catalog $latest_ffi is older OS than the system version $system_version"
                     echo
                     exit 1
@@ -1680,6 +1760,42 @@ run_fetch_full_installer() {
 }
 
 # -----------------------------------------------------------------------------
+# Run softwareupdate --list-full-installers and output to a file
+# Includes some fallbacks, because this function might not be available in some 
+# versions of Catalina
+# -----------------------------------------------------------------------------
+run_list_full_installers() {
+    if [[ $system_version_major -lt 13 || ($system_version_major -eq 13 && $system_version_minor -lt 4) ]]; then
+        # include betas if selected
+        if [[ $beta == "yes" ]]; then
+            writelog "[run_list_full_installers] Beta versions included"
+            if [[ ! $seedprogram ]]; then
+                seedprogram="PublicSeed"
+            fi
+        fi
+        set_seedprogram
+        echo
+        # try up to 3 times to workaround bug when changing seed programs
+        try=3
+        while [[ $try -gt 0 ]]; do
+            if /usr/sbin/softwareupdate --list-full-installers | grep -v "Deferred: YES" > "$workdir/ffi-list-full-installers.txt"; then
+                if [[ $(grep -c -E "Version:" "$workdir/ffi-list-full-installers.txt") -ge 1 ]]; then
+                    break
+                fi
+            fi
+            ((try--))
+        done
+        if [[ $try -eq 0 ]]; then
+            writelog "[run_list_full_installers] Could not obtain installer information using softwareupdate."
+            exit 1
+        fi
+    elif [[ $beta == "yes" ]]; then
+        echo "Seed program cannot be set on macOS 13.4 or greater."
+    fi
+
+}
+
+# -----------------------------------------------------------------------------
 # Run mist with chosen options.
 # This requires mist, so we first check if it is on the system and download them if not.
 # -----------------------------------------------------------------------------
@@ -1703,8 +1819,10 @@ run_mist() {
             echo
             exit 1
         fi
-        writelog "[run_mist] Restricting to selected OS $prechosen_os"
-        mist_args+=("$prechosen_os")
+        # to avoid a bug where mist-cli does a glob search for the major version, convert it to the name (this is resolved in mist-cli 2.0 but will leave here for now to avoid problems with older installations)
+        prechosen_os_name=$(convert_os_to_name "$prechosen_os")
+        writelog "[run_mist] Restricting to selected OS '$prechosen_os'"
+        mist_args+=("$prechosen_os_name")
 
     # restrict to a particular version if selected
     elif [[ $prechosen_version ]]; then
@@ -1712,12 +1830,14 @@ run_mist() {
         if [[ $prechosen_version_check -eq 10 ]]; then
             prechosen_version_major=$(cut -d. -f1,2 <<< "$prechosen_version")
             prechosen_version_minor=$(cut -d. -f3 <<< "$prechosen_version")
+            prechosen_version_patch=0
         else
             prechosen_version_major=$(cut -d. -f1 <<< "$prechosen_version")
-            prechosen_version_minor=$(cut -d. -f2,3 <<< "$prechosen_version")
+            prechosen_version_minor=$(cut -d. -f2 <<< "$prechosen_version")
+            prechosen_version_patch=$(cut -d. -f3 <<< "$prechosen_version")
         fi
         # check for an older version
-        if [[ $(echo "$prechosen_version_major < $system_version_major " | bc) == 1 || "$prechosen_version_major" == "$system_version_major" && $(echo "$prechosen_version_minor < $system_version_minor" | bc) == 1 ]]; then
+        if [[ $(echo "$prechosen_version_major < $system_version_major " | bc) == 1 || ("$prechosen_version_major" == "$system_version_major" && $(echo "$prechosen_version_minor < $system_version_minor" | bc) == 1) || ("$prechosen_version_major" == "$system_version_major" && "$prechosen_version_minor" == "$system_version_minor" && $(echo "$prechosen_version_patch < $system_version_patch" | bc) == 1) ]]; then
             writelog "[run_mist] ERROR: cannot select an older version than the system"
             echo
             exit 1
@@ -1764,13 +1884,15 @@ run_mist() {
         if [[ $latest_version_check -eq 10 ]]; then
             latest_version_major=$(cut -d. -f1,2 <<< "$latest_version")
             latest_version_minor=$(cut -d. -f3 <<< "$latest_version")
+            latest_version_patch=0
         else
             latest_version_major=$(cut -d. -f1 <<< "$latest_version")
-            latest_version_minor=$(cut -d. -f2,3 <<< "$latest_version")
+            latest_version_minor=$(cut -d. -f2 <<< "$latest_version")
+            latest_version_patch=$(cut -d. -f3 <<< "$latest_version")
         fi
         if [[ $latest_version ]]; then
-            if [[ $(echo "$latest_version_major < $system_version_major" | bc) == 1 || ("$latest_version_major" == "$system_version_major" && $(echo "$latest_version_minor < $system_version_minor" | bc) == 1) ]]; then
-                writelog "[run_mist] ERROR: latest version in catalog $latest_version is older OS than the system version $system_version"
+            if [[ $(echo "$latest_version_major < $system_version_major" | bc) == 1 || ("$latest_version_major" == "$system_version_major" && $(echo "$latest_version_minor < $system_version_minor" | bc) == 1) || ("$latest_version_major" == "$system_version_major" && "$latest_version_minor" == "$system_version_minor" && $(echo "$latest_version_patch < $system_version_patch" | bc) == 1) ]]; then
+                writelog "[run_mist] ERROR: latest version in catalog ($latest_version) is older OS than the system version ($system_version)"
                 echo
                 exit 1
             fi
@@ -2215,6 +2337,13 @@ show_help() {
     /bin/cat << HELP
     $script_name v$version, a script by @GrahamRPugh
 
+    Please note that network access is required to Apple's software catalogs at ALL stages of this
+    script's workflow - that includes BOTH download AND preparation stages. Please check that you are not
+    running any kind of security / firewall software that may prevent this traffic.
+
+    You must also not be restricting the execution of a macOS installer application in any way 
+    (e.g. Jamf Software Restriction, Santa etc.).
+
     Common usage:
     [sudo] ./$script_name.sh [options]
 
@@ -2236,12 +2365,16 @@ show_help() {
     --check-fmm         Prompt the user to disable Find My Mac before proceeding, when using --erase
     --fmm-wait-limit NN Maximum seconds to wait for removal of Find My Mac, if
                         --check-fmm is set. Default is 300.
+    --cleanup-after-use Creates a LaunchDaemon to delete $workdir after use. Mainly useful
+                        in conjunction with the --reinstall option.
 
     Options for filtering which installer to download/use:
 
-    --os X.Y            Finds a specific inputted OS version of macOS if available
+    --os NN | Name      Finds a specific inputted major macOS version if available
                         and downloads it if so. Will choose the latest matching build.
-    --version X.Y.Z     Finds a specific inputted minor version of macOS if available
+                        The name of the OS can be alternatively supplied, e.g. Sonoma
+                        or "macOS Sonoma"
+    --version NN.Y.Z    Finds a specific inputted minor version of macOS if available
                         and downloads it if so. Will choose the latest matching build.
     --build XYZ         Finds a specific inputted build of macOS if available
                         and downloads it if so.
@@ -2256,15 +2389,13 @@ show_help() {
                         and downloads the current installer within the limits set by --os or --version.
     --overwrite         Delete any existing macOS installer found in $installer_directory and download
                         the current installer within the limits set by --os or --version.
-    --clear-cache-only  When used in conjunction with --overwrite, --update or --replace-invalid,
-                        the existing installer is removed but not replaced. This is useful
-                        for running the script after an upgrade to clear the working files.
-    --cleanup-after-use Creates a LaunchDaemon to delete $workdir after use. Mainly useful
-                        in conjunction with the --reinstall option.
 
 
     Advanced options:
 
+    --clear-cache-only  When used in conjunction with --overwrite, --update or --replace-invalid,
+                        the existing installer is removed but not replaced. This is useful
+                        for running the script after an upgrade to clear the working files.
     --newvolumename     If using the --erase option, lets you customize the name of the
                         clean volume. Default is 'Macintosh HD'.
     --preinstall-command 'some arbitrary command'
@@ -2287,17 +2418,17 @@ show_help() {
     --keep-pkg          Retains a cached package if --move is used to extract an installer from it.
     --fs                Uses full-screen windows for all stages, not just the
                         preparation phase.
-    --no-fs             Replaces the full-screen dialog window with a smaller dialog,
-                        so you can still access the desktop while the script runs.
+    --no-fs             Replaces the full-screen dialog window with a smaller dialog during the preparation
+                        phase, so you can still access the desktop while the script runs.
     --beta              Include beta versions in the search. Works with the no-flag
                         (i.e. automatic), --os and --version arguments.
     --path /path/to     Overrides the destination of --move to a specified directory
     --min-drive-space   Override the default minimum space required for startosinstall
                         to run (45 GB).
-    --no-curl           Prevents the download of swiftDialog or mist in case your
+    --no-curl           Prevents the download of swiftDialog, mist and icons in case your
                         security team don't like it.
     --no-timeout        The script will normally timeout if the installer has not successfully
-                        prepared after 1 hour. This extends that time limit to 1 day.
+                        prepared after 1 hour. This extends that time limit to 24 hours.
 
     Extra packages:
         startosinstall --eraseinstall can install packages after the new installation. 
@@ -2308,19 +2439,25 @@ show_help() {
     Parameters for use with Apple Silicon Mac:
         Note that startosinstall requires user authentication on AS Mac. The user
         must have a Secure Token. This script checks for the Secure Token of the
-        supplied user. A dialog is used to supply the password, so
-        this script cannot be run at the login window or from remote terminal.
+        current user, but the user can be overridden via the dialog. 
+        A dialog is used to supply the password, so this script cannot be run at the 
+        login window or from remote terminal.
 
     --max-password-attempts NN | infinite
                         Overrides the default of 5 attempts to ask for the user's password. Using
                         'infinite' will disable the Cancel button and asking until the password is
                         successfully verified.
+    --user              Override the user (the default is the current user).
+    --very-insecure-mode
+                        Invokes passwordless upgrades, for use with lab machines. NOT RECOMMENDED UNLESS
+                        YOU CAN GUARANTEE PHYSICAL AND REMOTE SECURITY ON THE COMPUTER IN QUESTION.
+    --credentials       A base64 credential set. Only works in conjunction with --very-insecure-mode
 
     Experimental features:
 
     --fetch-full-installer | --ffi | -f
                         Obtain the installer using 'softwareupdate --fetch-full-installer' method instead of
-                        using mist
+                        using mist-cli. 
     --list              List installers using 'softwareupdate --list-full-installers' when
                         called with --fetch-full-installer
     --seed ...          Select a non-standard seed program. This is only used with --fetch-full-installer 
@@ -2330,10 +2467,8 @@ show_help() {
     --kc                Keychain containing a user password (do not use the login keychain!!)
     --kc-pass           Password to open the keychain
     --kc-service        The name of the key containing the account and password
-    --credentials       A base64 credential set. Only works in conjunction with
-    --i-know-the-security-risks-and-i-still-want-to-supply-a-password-in-plain-text
-    --silent            Silent mode. No dialogs. Requires use of keychain for Apple Silicon 
-                        to provide a password, or the --credentials mode.
+    --silent            Silent mode. No dialogs. Requires use of keychain (--kc mode) for Apple Silicon 
+                        to provide a password, or the --credentials/--very-insecure-mode mode.
     --quiet             Remove output from mist during installer download. Note that no progress 
                         is shown.
     --preservecontainer Preserves other volumes in your APFS container when using --erase
@@ -2355,35 +2490,12 @@ HELP
 }
 
 # -----------------------------------------------------------------------------
-# Run softwareupdate --list-full-installers and output to a file
-# Includes some fallbacks, because this function might not be available in some 
-# versions of Catalina
+# Return code 143 and finish the script when TERMinated or INTerrupted
 # -----------------------------------------------------------------------------
-run_list_full_installers() {
-    # include betas if selected
-    if [[ $beta == "yes" ]]; then
-        writelog "[run_list_full_installers] Beta versions included"
-        if [[ ! $seedprogram ]]; then
-            seedprogram="PublicSeed"
-        fi
-    fi
-    set_seedprogram
-
-    echo
-    # try up to 3 times to workaround bug when changing seed programs
-    try=3
-    while [[ $try -gt 0 ]]; do
-        if /usr/sbin/softwareupdate --list-full-installers | grep -v "Deferred: YES" > "$workdir/ffi-list-full-installers.txt"; then
-            if [[ $(grep -c -E "Version:" "$workdir/ffi-list-full-installers.txt") -ge 1 ]]; then
-                break
-            fi
-        fi
-        ((try--))
-    done
-    if [[ $try -eq 0 ]]; then
-        writelog "[run_list_full_installers] Could not obtain installer information using softwareupdate."
-        exit 1
-    fi
+# shellcheck disable=SC2317
+terminate() {
+    writelog "[terminate] Script was interrupted (last exit code was $?)"
+    exit 143
 }
 
 # -----------------------------------------------------------------------------
@@ -2491,44 +2603,6 @@ user_not_volume_owner() {
         # run the dialog command
         "$dialog_bin" "${dialog_args[@]}" 2>/dev/null
     fi
-}
-
-# -----------------------------------------------------------------------------
-# Rotate existing log files up to a maximum of 9 log files
-# Older files will be overwritten
-# -----------------------------------------------------------------------------
-log_rotate() {
-    # logs probably cannot be rotated when running as root
-    if [[ $EUID -ne 0 ]]; then
-        writelog "[log_rotate] Not running as root so cannot rotate logs"
-        return
-    fi
-
-    writelog "[log_rotate] Start rotating logs in $logdir"
-    max_log_keep=9
-
-    # move all logs up one file
-    i="$max_log_keep"
-    while [[ "$i" -gt 0 ]];do
-        current_filename="$LOG_FILE.$((i-1))"
-        new_filename="$LOG_FILE.$i"
-        if [[ -f "$current_filename" ]];then
-            writelog "[log_rotate] moving $current_filename to $new_filename"
-            mv "$current_filename" "$new_filename"
-        fi
-        ((i--))
-    done
-
-    if [[ -f "$LOG_FILE" ]];then
-        writelog "[log_rotate] moving $LOG_FILE to $LOG_FILE.1"
-        mv "$LOG_FILE" "$LOG_FILE.1"
-    fi
-
-    # now create the new log file
-    echo "" > "$LOG_FILE"
-    exec > >(tee "${LOG_FILE}") 2>&1
-
-    writelog "[log_rotate] Finished rotating logs in $logdir"
 }
 
 # -----------------------------------------------------------------------------
@@ -2814,33 +2888,32 @@ while test $# -gt 0 ; do
     shift
 done
 
+# create tmp working and log directories if not running as root
+if [[ $EUID -ne 0 && "$list" == "yes" ]]; then
+    workdir=$(/usr/bin/mktemp -d /var/tmp/erase-install.XXX)
+    writelog "[$script_name] Not running as root so will write output and logs to $workdir."
+    logdir="$workdir"
+fi
+
+# ensure logdir and workdir exist
+if [[ ! -d "$workdir" ]]; then
+    writelog "[$script_name] Making working directory at $workdir"
+    /bin/mkdir -p "$workdir"
+fi
+if [[ ! -d "$logdir" ]]; then
+    writelog "[$script_name] Making log directory at $logdir"
+    /bin/mkdir -p "$logdir"
+fi
+
+# all output from now on is written also to a log file
+LOG_FILE="$logdir/erase-install.log"
+log_rotate
+
 # output that the script has started running
 echo
 writelog "[$script_name] v$version script execution started: $(date)"
 echo
 writelog "[$script_name] Arguments provided: $all_args"
-
-# exit out or correct for incompatible options
-if [[ $erase == "yes" && $reinstall == "yes" ]]; then
-    writelog "[$script_name] ERROR: Choose either --erase or --reinstall options, but not both!"
-    exit 1
-elif [[ ($prechosen_os && $prechosen_version) || ($prechosen_os && $prechosen_build) || ($prechosen_version && $prechosen_build) || ($sameos && $prechosen_version) || ($sameos && $prechosen_os) || ($sameos && $prechosen_build) ]]; then
-    writelog "[$script_name] ERROR: Choose a maximum of one of the --os, --version, --build, or --sameos options at the same time!"
-    exit 1
-elif [[ ($overwrite == "yes" && $update_installer == "yes") || ($replace_invalid_installer == "yes" && $overwrite == "yes") || ($replace_invalid_installer == "yes" && $update_installer == "yes") ]]; then
-    writelog "[$script_name] ERROR: Choose a maximum of one of the --overwrite, --update, or --replace-invalid options at the same time!"
-    exit 1
-fi
-
-# account for when people mistakenly put a version string instead of a major OS
-if [[ "$prechosen_os" ]]; then
-    prechosen_os_check=$(cut -d. -f1 <<< "$prechosen_os")
-    if [[ $prechosen_os_check = 10 ]]; then
-        prechosen_os=$(cut -d. -f1,2 <<< "$prechosen_os")
-    else
-        prechosen_os=$(cut -d. -f1 <<< "$prechosen_os")
-    fi
-fi
 
 # announce if the Test Run mode is implemented
 if [[ $erase == "yes" || $reinstall == "yes" ]]; then
@@ -2855,6 +2928,16 @@ if [[ $erase == "yes" || $reinstall == "yes" ]]; then
     fi
 fi
 
+# account for when people mistakenly put a version string instead of a major OS
+if [[ "$prechosen_os" ]]; then
+    prechosen_os_check=$(cut -d. -f1 <<< "$prechosen_os")
+    if [[ $prechosen_os_check = 10 ]]; then
+        prechosen_os=$(cut -d. -f1,2 <<< "$prechosen_os")
+    else
+        prechosen_os=$(cut -d. -f1 <<< "$prechosen_os")
+    fi
+fi
+
 # some options vary based on installer versions
 system_version=$( /usr/bin/sw_vers -productVersion )
 system_build=$( /usr/bin/sw_vers -buildVersion )
@@ -2862,9 +2945,11 @@ system_os=$(cut -d. -f 1 <<< "$system_version")
 if [[ $system_os -eq 10 ]]; then
     system_version_major=$(cut -d. -f1,2 <<< "$system_version")
     system_version_minor=$(cut -d. -f3 <<< "$system_version")
+    system_version_patch=0
 else
     system_version_major=$(cut -d. -f1 <<< "$system_version")
-    system_version_minor=$(cut -d. -f2,3 <<< "$system_version")
+    system_version_minor=$(cut -d. -f2 <<< "$system_version")
+    system_version_patch=$(cut -d. -f3 <<< "$system_version")
 fi
 
 writelog "[$script_name] System version: $system_version (Build: $system_build)"
@@ -2884,23 +2969,6 @@ if [[ $(echo "$system_version_major < 10.15" | bc) == 1 ]]; then
     exit 1
 fi
 
-# create tmp working and log directories if not running as root
-if [[ $EUID -ne 0 && "$list" == "yes" ]]; then
-    workdir=$(/usr/bin/mktemp -d /var/tmp/erase-install.XXX)
-    writelog "[$script_name] Not running as root so will write output and logs to $workdir."
-    logdir="$workdir"
-fi
-
-# ensure logdir and workdir exist
-if [[ ! -d "$workdir" ]]; then
-    writelog "[$script_name] Making working directory at $workdir"
-    /bin/mkdir -p "$workdir"
-fi
-if [[ ! -d "$logdir" ]]; then
-    writelog "[$script_name] Making log directory at $logdir"
-    /bin/mkdir -p "$logdir"
-fi
-
 if [[ ! $silent ]]; then
     # bail if system is older than macOS 11 and --silent mode is not selected
     if [[ $(echo "$system_version_major < 11" | bc) == 1 ]]; then
@@ -2910,6 +2978,18 @@ if [[ ! $silent ]]; then
     fi
     # get dialog app if not silent mode
     check_for_swiftdialog_app
+fi
+
+# exit out or correct for incompatible options
+if [[ $erase == "yes" && $reinstall == "yes" ]]; then
+    writelog "[$script_name] ERROR: Choose either --erase or --reinstall options, but not both!"
+    exit 1
+elif [[ ($prechosen_os && $prechosen_version) || ($prechosen_os && $prechosen_build) || ($prechosen_version && $prechosen_build) || ($sameos && $prechosen_version) || ($sameos && $prechosen_os) || ($sameos && $prechosen_build) ]]; then
+    writelog "[$script_name] ERROR: Choose a maximum of one of the --os, --version, --build, or --sameos options at the same time!"
+    exit 1
+elif [[ ($overwrite == "yes" && $update_installer == "yes") || ($replace_invalid_installer == "yes" && $overwrite == "yes") || ($replace_invalid_installer == "yes" && $update_installer == "yes") ]]; then
+    writelog "[$script_name] ERROR: Choose a maximum of one of the --overwrite, --update, or --replace-invalid options at the same time!"
+    exit 1
 fi
 
 # different dialog icon for OS older than macOS 13
@@ -2930,10 +3010,6 @@ if [[ ! -d "$installer_directory" ]]; then
     writelog "[$script_name] Making installer directory at $installer_directory"
     /bin/mkdir -p "$installer_directory"
 fi
-
-# all output from now on is written also to a log file
-LOG_FILE="$logdir/erase-install.log"
-log_rotate
 
 # if getting a list from softwareupdate then we don't need to make any OS checks
 if [[ $list == "yes" && ! $ffi ]]; then
@@ -2980,40 +3056,16 @@ fi
 writelog "[$script_name] Looking for existing installer app or pkg"
 find_existing_installer
 
+
 # Work through various options to decide whether to replace an existing installer
-if [[ $overwrite == "yes" && -d "$working_macos_app" && ! $list ]]; then
+do_overwrite_existing_installer=0
+
+if [[ $overwrite == "yes" && (-d "$working_macos_app" || ($pkg_installer && -f "$working_installer_pkg")) && ! $list ]]; then
     # --overwrite option
-    overwrite_existing_installer
+    do_overwrite_existing_installer=1
+fi
 
-elif [[ $overwrite == "yes" && ($pkg_installer && -f "$working_installer_pkg") && ! $list ]]; then
-    # --overwrite option and --pkg option
-    writelog "[$script_name] Deleting invalid installer package"
-    rm -f "$working_installer_pkg"
-    if [[ $clear_cache == "yes" ]]; then
-        writelog "[$script_name] Quitting script as --clear-cache-only option was selected."
-        # kill caffeinate
-        kill_process "caffeinate"
-        exit
-    fi
-
-elif [[ $invalid_installer_found == "yes" ]]; then 
-    # --replace-invalid option: replace an existing installer if it is invalid
-    if [[ -d "$working_macos_app" && ($replace_invalid_installer == "yes" || $update_installer == "yes") ]]; then
-        overwrite_existing_installer
-    elif [[ ($pkg_installer && ! -f "$working_installer_pkg") && $replace_invalid_installer == "yes" ]]; then
-        writelog "[$script_name] Deleting invalid installer package"
-        rm -f "$working_installer_pkg"
-        overwrite_existing_installer
-    elif [[ ($erase == "yes" || $reinstall == "yes") && $skip_validation != "yes" ]]; then
-        writelog "[$script_name] ERROR: Invalid installer is present. Run with --overwrite option to ensure that a valid installer is obtained."
-        # kill caffeinate
-        kill_process "caffeinate"
-        exit 1
-    else
-        writelog "[$script_name] ERROR: Invalid installer is present. --skip-validation was set so we will continue, but failure is highly likely!"
-    fi
-
-elif [[ "$prechosen_build" != "" ]]; then
+if [[ "$prechosen_build" != "" ]]; then
     # automatically replace a cached installer if it does not match the requested build
     writelog "[$script_name] Checking if the cached installer matches requested build..."
     if [[ "$installer_build" ]]; then
@@ -3021,15 +3073,16 @@ elif [[ "$prechosen_build" != "" ]]; then
     elif [[ "$installer_pkg_build" ]]; then
         installer_darwin_version=${installer_pkg_build:0:2}
     fi
-    compare_build_versions "$prechosen_build" "$installer_build"
+    compare_build_versions "$prechosen_build" "$prechosen_build"
     if [[ "$builds_match" != "yes" ]]; then
-        writelog "[$script_name] Existing installer does not match requested build, so replacing..."
-        overwrite_existing_installer
+        writelog "[$script_name] Existing installer build $prechosen_build does not match requested build $prechosen_build."
+        do_overwrite_existing_installer=1
     else
         writelog "[$script_name] Existing installer matches requested build."
     fi
+fi
 
-elif [[ "$prechosen_os" != "" ]]; then
+if [[ "$prechosen_os" != "" ]]; then
     # check if the cached installer matches the requested OS
     # first, get the OS of the existing installer app or pkg
     if [[ "$installer_build" ]]; then
@@ -3039,54 +3092,53 @@ elif [[ "$prechosen_os" != "" ]]; then
     fi
     prechosen_darwin_version=$(get_darwin_from_os_version "$prechosen_os")
     if [[ $installer_darwin_version -ne $prechosen_darwin_version ]]; then
-        writelog "[$script_name] Existing installer does not match requested OS ($prechosen_os), so replacing..."
-        overwrite_existing_installer
+        writelog "[$script_name] Existing installer OS version does not match requested OS ($prechosen_os)."
+        do_overwrite_existing_installer=1
     fi
+fi
 
-elif [[ $update_installer == "yes" ]]; then
+if [[ $update_installer == "yes" ]]; then
     # --update option: checks for a newer installer. This operates within the confines of the --sameos, --os, --version and --beta options if present
-    if [[ -d "$working_macos_app" ]]; then
+    if [[ -d "$working_macos_app" || -f "$working_installer_pkg" ]]; then
         writelog "[$script_name] Checking for newer installer"
         check_newer_available
         if [[ $newer_build_found == "yes" ]]; then
-            writelog "[$script_name] Newer installer found so overwriting existing installer"
-            overwrite_existing_installer
-        elif [[ $clear_cache == "yes" ]]; then
-            writelog "[$script_name] Quitting script as --clear-cache-only option was selected."
-            # kill caffeinate
-            kill_process "caffeinate"
-            exit
-        fi
-    elif [[ $pkg_installer && -f "$working_installer_pkg" ]]; then
-        writelog "[$script_name] Checking for newer installer package"
-        check_newer_available
-        if [[ $newer_build_found == "yes" ]]; then
-            writelog "[$script_name] Newer installer found so deleting existing installer package"
-            rm -f "$working_installer_pkg"
-        fi
-        if [[ $clear_cache == "yes" ]]; then
-            writelog "[$script_name] Quitting script as --clear-cache-only option was selected."
-            # kill caffeinate
-            kill_process "caffeinate"
-            exit
+            writelog "[$script_name] Newer installer found."
+            do_overwrite_existing_installer=1
         fi
     fi
 fi
 
+if [[ $invalid_installer_found == "yes" ]]; then 
+    # --replace-invalid option: replace an existing installer if it is invalid
+    if [[ -d "$working_macos_app" && $replace_invalid_installer == "yes" ]]; then
+        do_overwrite_existing_installer=1
+    elif [[ -f "$working_installer_pkg" && $replace_invalid_installer == "yes" ]]; then
+        do_overwrite_existing_installer=1
+    elif [[ ($erase == "yes" || $reinstall == "yes") && $skip_validation != "yes" ]]; then
+        writelog "[$script_name] ERROR: Invalid installer is present. Run with --overwrite, --update or --replace-invalid option to ensure that a valid installer is obtained."
+        # kill caffeinate
+        kill_process "caffeinate"
+        exit 1
+    elif [[ $skip_validation != "yes" ]]; then
+        writelog "[$script_name] ERROR: Invalid installer is present. Run with --overwrite, --update or --replace-invalid option to ensure that a valid installer is obtained."
+    else
+        writelog "[$script_name] ERROR: Invalid installer is present. --skip-validation was set so we will continue, but failure is highly likely!"
+    fi
+fi
+
+# now go ahead and remove the existing installer if any conditions were met to do so
+if [[ $do_overwrite_existing_installer == 1 ]]; then
+    overwrite_existing_installer
+fi
+
 # Silicon Macs require a username and password to run startosinstall
-# We therefore need to be logged in to proceed, if we are going to erase or reinstall
+# We therefore need credentials to proceed, if we are going to erase or reinstall
 # This goes before the download so users aren't waiting for the prompt for username
 # Check for Apple Silicon using sysctl, because arch will not report arm64 if running under Rosetta.
 [[ $(/usr/sbin/sysctl -q -n "hw.optional.arm64") -eq 1 ]] && arch="arm64" || arch=$(/usr/bin/arch)
 writelog "[$script_name] Running on architecture $arch"
 if [[ "$arch" == "arm64" && ($erase == "yes" || $reinstall == "yes") ]]; then
-    if ! pgrep -q Finder ; then
-        writelog "[$script_name] ERROR! The startosinstall binary requires a user to be logged in."
-        echo
-        # kill caffeinate
-        kill_process "caffeinate"
-        exit 1
-    fi
     get_user_details
 fi
 
@@ -3275,9 +3327,22 @@ if [[ $erase == "yes" && $newvolumename ]]; then
 fi
 
 # icon for dialogs
-macos_installer_icon="$working_macos_app/Contents/Resources/InstallAssistant.icns"
-if [[ -f "$macos_installer_icon" ]]; then
-    dialog_install_icon="$macos_installer_icon"
+# macos_installer_icon="$working_macos_app/Contents/Resources/InstallAssistant.icns"
+macos_app_name=$(basename "$working_macos_app" | cut -d. -f1)
+
+# look for the image in the workdir
+icon_path="$workdir/icons/$macos_app_name.png"
+if ! file -b "$icon_path" | grep "PNG image data" > /dev/null; then
+    if [[ ! $no_curl == "yes" ]]; then
+        # download the image from github
+        macos_installer_icon_url="https://github.com/grahampugh/erase-install/blob/main/icons/$macos_app_name.png?raw=true"
+        curl -L "$macos_installer_icon_url" -o "$icon_path"
+    fi
+fi
+
+# check again whether we have the image now, if not, display a generic image
+if file -b "$icon_path" | grep "PNG image data"; then
+    dialog_install_icon="$icon_path"
 else
     dialog_install_icon="warning"
 fi
@@ -3388,9 +3453,6 @@ if [[ "$arch" == "arm64" ]]; then
         fi
     fi
 fi
-
-# fix for a bug in mist-cli to correct the installer app permissions
-/bin/chmod -R 755 "$working_macos_app"
 
 # now actually run startosinstall
 launch_startosinstall
